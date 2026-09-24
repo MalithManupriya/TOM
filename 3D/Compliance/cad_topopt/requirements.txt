@@ -1,0 +1,10 @@
+numpy
+scipy
+gmsh
+meshio
+trimesh
+rtree
+pyvista
+scikit-fem
+scikit-image
+fast-simplification

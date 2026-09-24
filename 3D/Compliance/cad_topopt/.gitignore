@@ -1,0 +1,6 @@
+__pycache__/
+*.npz
+*.png
+*.stl
+*.vtu
+output/
