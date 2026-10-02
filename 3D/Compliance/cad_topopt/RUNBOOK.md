@@ -44,6 +44,53 @@ config.py  ──►  main.py          Stage 1/2  pick + verify CAD faces
            ──►  reconstruct_main.py Stage 7/8 density field -> STL -> STEP solid
 ```
 
+### Boundary conditions — groups, one direction each
+
+`INPUT` and `OUTPUT` in `config.py` are **lists of groups**. Each group is some
+faces acting along one signed direction, and every group can have its own:
+
+```python
+INPUT = [
+    {"name": "actuator", "faces": [15], "direction": "-x", "displacement": 0.004},
+]
+OUTPUT = [   # two jaws closing on each other
+    {"name": "upper jaw", "faces": [8],  "direction": "-y", "spring_stiffness": 500.0},
+    {"name": "lower jaw", "faces": [10], "direction": "+y", "spring_stiffness": 500.0},
+]
+```
+
+- **direction**: `x`/`y`/`z`, optionally `+`/`-`. For an input, `"-x"` with
+  `0.004` and `"x"` with `-0.004` mean the same thing (4 mm towards −x).
+- **Input groups** all ramp together, in proportion, over the `nstep` load steps.
+- **Output groups** each get a grounded spring on their own axis. The optimiser
+  flattens the **total** `Fout` = sum over groups of each group's spring force
+  measured along **its own** direction. So two jaws closing on each other both
+  count positive, and each jaw of a symmetric gripper carries `Fout / 2`.
+  It flattens the total, not each jaw separately.
+- A plain dict (the old format) still works and means one group.
+- The same face may appear in several groups of one role (e.g. driven in x
+  *and* y). Across roles a face is still exclusive.
+
+**Check directions before optimising.** `voxel_main.py --show` draws an arrow per
+group: inputs point the way they're driven, outputs the way their force counts
+positive (a gripper's two arrows should point at each other).
+`linear_check_main.py` prints each group's displacement along its own direction
+and the sign of `Fout`, and warns when the outputs move against their configured
+directions. That warning matters because with `Ftar = None` the optimiser takes
+its target from the starting response, so a negative `Fout` means it will
+flatten a force in the **opposite** direction. Either fix the directions or set
+`OPTIMIZATION["Ftar"]` to a positive value.
+
+How it is wired: `mesh/boundary.py` turns the groups into DOF arrays (`DofBCs`)
+used by **both** Stage 4 and Stage 5, so the linear preview and the
+optimisation can never disagree about the BCs. It also resolves overlaps.
+Input/input on the same DOF merges if the values agree and errors if they
+don't. Output/output merges with the springs added. This merge is mandatory
+because numpy's fancy-index `+=` applies a repeated index only once.
+`VoxelModel` overrides only `step` and `force_path` from `top3d_cf.py`, each a
+line-for-line copy with three lines marked `CHANGED`; `newton` and the element
+code are still inherited untouched.
+
 ### Stage 1/2 — face selection
 
 ```bash
@@ -82,8 +129,8 @@ python linear_check_main.py --show       # deformed shape (GUI)
 
 Deliberately uses scikit-fem, **not** `top3d_cf.py`, so a mesh/BC wiring bug
 can't be confirmed by the same code that caused it. Look for: clamp + input
-reactions summing to zero, ~0 residual on free dofs, and nonzero output
-displacement in the configured direction.
+reactions summing to zero, ~0 residual on free dofs, each output group moving
+**along** its configured direction (positive), and a positive `Fout`.
 
 ### Stage 5/6 — optimization
 
@@ -95,8 +142,28 @@ python optimize_main.py --run --vtu design.vtu    # ... and export
 ```
 
 `--verify` runs on a fixed small `cad_models/sample_bracket.step`, **not** your
-config — so it stays meaningful while `config.py` is mid-edit. Run it after any
-change to `optimization/voxel_model.py`.
+config — so it stays meaningful while `config.py` is mid-edit. It checks two
+load cases: **single direction** (the original one) and **multi direction**
+(a signed input, a second input on another face and axis, and two output jaws
+with opposite signs and different stiffnesses). It also checks the GCMMA
+optimiser against SciPy's SLSQP on two small problems with known optima. Run
+it after any change to `optimization/voxel_model.py`, `optimization/mma.py`
+or `mesh/boundary.py`.
+
+**Optimiser.** `config.OPTIMIZER = "mma"` (the default) runs
+`optimization/mma.py`: `top3d_cf.optimise()` line for line, except that the
+design update is one step of Svanberg's GCMMA. GCMMA evaluates each proposed
+design and, if it overshot, shortens the step and tries again. The last log
+column, `solves`, counts the force-path solves each iteration took. Plain MMA
+was tried first and left the output force swinging about ±12% around the
+target indefinitely. The volume is held at exactly `volfrac`, as
+`top3d_cf.optimise()`'s bisection does. With only an upper bound the design
+stayed grey below the projection threshold, and each beta doubling deleted
+more of it (volume 0.27 → 0.04 by beta 8). `"pg"` runs `top3d_cf.optimise()`
+itself, whose projected-gradient step moves the most sensitive elements by the
+full `move` every iteration and so flip-flops instead of settling. It is kept
+only for comparison. GCMMA's `change` column should shrink as the design settles.
+`pg`'s stays at `move`.
 
 **Always pass `--save-result`** on a real run:
 
@@ -165,6 +232,18 @@ All four stages run clean as of **2026-09-23**, on `cad_models/Part1.STEP` at
 | 7 | `reconstruct_main.py` | **PASS** — watertight, 1 body, smooth (see below) |
 | 8 | `reconstruct_main.py --step` | **PASS** — re-imports as 1 solid, volume err 1.8e-14 |
 
+**Per-group BCs (2026-09-24).** The refactor was checked to change nothing
+for the old single-direction setup. The single-direction self-test reproduces
+its fint and Kt errors bit for bit (3.024e-09, 1.285e-10). The old and new
+`Fout` formulas agree to 1.8e-16 relative. On Part1, Stage 3 node counts
+(153/25/204) and Stage 4 (max |u| 0.00402428 m, reactions ±7802.4 N) are
+identical. The multi-direction self-test passes. Its adjoint error falls from
+5.2e-05 at the default step to ~1e-8–1e-9 as the finite-difference step
+grows, which is rounding noise, not a gradient error. A two-jaw gripper on
+Part1 (face 15 at −x, jaws 8 at −y and 10 at +y) runs end to end: both jaws
+close by 1.249e-04 m in the linear preview (symmetric, as they should), and
+2 real optimiser iterations run with a positive auto target, Ftar = +0.057 N.
+
 Stage 7/8 were verified two ways. First on a **synthetic all-solid density
 field**, where the exact answer is known: the extracted surface reproduced the
 voxel bounding box to **8.7e-19 m** and 99.2% of the exact volume at `--sigma 0`,
@@ -213,14 +292,18 @@ output force is measured over a partly-clamped face.
 Fix by choosing clamp and output faces that don't touch, before trusting any
 `--run` result quantitatively.
 
-### 2. INPUT and OUTPUT are on opposite ends — CHECK BEFORE A FULL RUN
+### 2. The configured output moves AGAINST its direction — OPEN, decide
 
-`top3d_cf.py`'s README warns that input and output should sit on the **same free
-end, along the same axis**, or the initial force path is sign-indefinite and the
-optimiser refuses to start. Here `INPUT` is face 15 at x = +0.01 and `OUTPUT` is
-faces 8/10 at x = -0.0035 — opposite ends. It did start (ripple was 124% → 112%
-over two iterations), but this is worth confirming against the intended
-mechanism before reading anything into a converged result.
+`INPUT` is face 15 at x = +0.01; `OUTPUT` is faces 8/10 at x = -0.0035, counted
+along **+x**. `linear_check_main.py` shows the output actually moves **−x**
+(-1.30e-05 m), so `Fout` is negative. That is why the 100-iteration run chose
+Ftar = −0.005 N: it optimised a constant force in the direction **opposite**
+to the configured one. It is also why Fout was so tiny: pushing the far end
+barely moves the slot walls along x.
+
+If the part is meant to be a gripper, the jaws (8, 10) close along **y**, not
+x. That load case gives a 10× larger, positive output (Fout +0.125 N linear,
+Ftar +0.057 N) — see the commented example in `config.py`.
 
 ### 3. `--threshold 0.5` only works on a *converged* run — by design
 

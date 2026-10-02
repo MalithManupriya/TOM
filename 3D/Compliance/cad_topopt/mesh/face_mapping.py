@@ -18,14 +18,49 @@ from __future__ import annotations
 import numpy as np
 import gmsh
 
-from cad.face_manager import FaceAssignment
+from cad.face_manager import BCGroup, FaceAssignment
 from mesh.voxelize import VoxelGrid
 
 _BC_ROLES = ("clamp", "input", "output")
 
 
+def face_node_sets(faces, grid: VoxelGrid, tol: float | None = None,
+                   cache: dict | None = None) -> dict[int, np.ndarray]:
+    """Surface nodes within `tol` of each CAD face, per face.
+
+    This is the only geometric (slow) part -- one getClosestPoint per
+    candidate node. Pass the same `cache` dict to several calls on one grid
+    and each face is measured once, however many roles/groups use it.
+    """
+    tol = 0.5 * grid.h if tol is None else tol
+    cache = {} if cache is None else cache
+    cand_idx = np.nonzero(grid.surface_node)[0]
+    cand_xyz = grid.node_xyz[cand_idx]
+
+    for tag in faces:
+        if tag in cache:
+            continue
+        xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(2, tag)
+        in_box = ((cand_xyz[:, 0] >= xmin - tol) & (cand_xyz[:, 0] <= xmax + tol) &
+                  (cand_xyz[:, 1] >= ymin - tol) & (cand_xyz[:, 1] <= ymax + tol) &
+                  (cand_xyz[:, 2] >= zmin - tol) & (cand_xyz[:, 2] <= zmax + tol))
+        hit = []
+        for n in np.nonzero(in_box)[0]:
+            coord, _ = gmsh.model.getClosestPoint(2, tag, cand_xyz[n].tolist())
+            if float(np.linalg.norm(np.asarray(coord) - cand_xyz[n])) <= tol:
+                hit.append(cand_idx[n])
+        cache[tag] = np.array(sorted(hit), dtype=int)
+    return {tag: cache[tag] for tag in faces}
+
+
+def _union(face_sets: dict[int, np.ndarray], faces) -> np.ndarray:
+    parts = [face_sets[t] for t in faces]
+    return np.unique(np.concatenate(parts)) if parts else np.zeros(0, dtype=int)
+
+
 def map_faces_to_nodes(assignment: FaceAssignment, grid: VoxelGrid,
-                        tol: float | None = None) -> dict[str, np.ndarray]:
+                        tol: float | None = None,
+                        cache: dict | None = None) -> dict[str, np.ndarray]:
     """Return {"clamp": node_ids, "input": node_ids, "output": node_ids}.
 
     tol defaults to half an element. That is the useful compromise: on a
@@ -35,26 +70,14 @@ def map_faces_to_nodes(assignment: FaceAssignment, grid: VoxelGrid,
     boundary staircases and no node sits exactly on the surface -- it still
     captures the nodes hugging it. A tol of a full h silently grabs a
     second layer of nodes on flat faces.
-    """
-    tol = 0.5 * grid.h if tol is None else tol
-    cand_idx = np.nonzero(grid.surface_node)[0]
-    cand_xyz = grid.node_xyz[cand_idx]
 
-    result: dict[str, np.ndarray] = {}
-    for role in _BC_ROLES:
-        faces = assignment.faces_with_role(role)
-        best = np.full(len(cand_idx), np.inf)
-        for tag in faces:
-            xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(2, tag)
-            in_box = ((cand_xyz[:, 0] >= xmin - tol) & (cand_xyz[:, 0] <= xmax + tol) &
-                      (cand_xyz[:, 1] >= ymin - tol) & (cand_xyz[:, 1] <= ymax + tol) &
-                      (cand_xyz[:, 2] >= zmin - tol) & (cand_xyz[:, 2] <= zmax + tol))
-            for n in np.nonzero(in_box)[0]:
-                coord, _ = gmsh.model.getClosestPoint(2, tag, cand_xyz[n].tolist())
-                d = float(np.linalg.norm(np.asarray(coord) - cand_xyz[n]))
-                if d < best[n]:
-                    best[n] = d
-        result[role] = cand_idx[best <= tol]
+    These are the *role* unions (every input group together, etc.), used for
+    viewing and structural checks; see map_groups_to_nodes for per-group sets.
+    """
+    faces = [t for role in _BC_ROLES for t in assignment.faces_with_role(role)]
+    sets = face_node_sets(faces, grid, tol, cache)
+    result = {role: _union(sets, assignment.faces_with_role(role))
+              for role in _BC_ROLES}
 
     for a, b in (("clamp", "input"), ("clamp", "output"), ("input", "output")):
         both = set(result[a]) & set(result[b])
@@ -64,3 +87,12 @@ def map_faces_to_nodes(assignment: FaceAssignment, grid: VoxelGrid,
                   f"Stage 5 cannot both fix and load the same node -- pick "
                   f"faces that do not touch, or decide which role wins.")
     return result
+
+
+def map_groups_to_nodes(groups: list[BCGroup], grid: VoxelGrid,
+                        tol: float | None = None,
+                        cache: dict | None = None) -> list[np.ndarray]:
+    """One node set per INPUT/OUTPUT group, in the same order as `groups`."""
+    faces = sorted({t for g in groups for t in g.faces})
+    sets = face_node_sets(faces, grid, tol, cache)
+    return [_union(sets, g.faces) for g in groups]

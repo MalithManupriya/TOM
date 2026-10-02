@@ -27,36 +27,71 @@ TOP3D_CF_DIR = PROJECT_DIR.parent / "files"
 STEP_FILE = PROJECT_DIR / "cad_models" / "Part1.step"
 
 # --- Boundary-condition face assignments -----------------------------------
-# "faces" (a list of integer Face IDs) is the only key Stage 1/2 actually
-# uses right now. The remaining keys (direction, displacement, dofs,
-# spring_stiffness) are not read yet -- they are for Stage 5, when these
-# boundary conditions get wired into the nonlinear solver from top3d_cf.py.
-# They are defined here now so the config format/shape does not change later
-# and so you can see the full intended meaning of each face group up front.
-#
-# The values below are for Part1.step. Re-run `python main.py --show` and
+# The values below are for Part1.step. Re-run `python main.py --list` and
 # update these any time the CAD geometry or face numbering changes -- Gmsh
 # can renumber faces after even a small edit upstream in SolidWorks.
-# Reminder from top3d_cf.py's README: input and output should sit on the
-# same free end, acting along the same axis, or the initial force path comes
-# out sign-indefinite and the optimiser will refuse to start.
+#
+# INPUT and OUTPUT are LISTS OF GROUPS. Each group is some faces acting
+# along ONE signed direction, and every group can have its own direction:
+#
+#   direction      "x", "y", "z", optionally "+x" / "-x" etc.
+#
+#   INPUT group    "displacement": m moved along `direction` at full stroke.
+#                  "-x" with 0.004 and "x" with -0.004 both mean "pushed
+#                  4 mm towards -x". All input groups ramp together, in
+#                  proportion, over the nstep load steps.
+#
+#   OUTPUT group   "direction": the way this group's motion counts as
+#                  POSITIVE output force. "spring_stiffness": N/m, a grounded
+#                  spring (the load, e.g. tissue) on this group's faces.
+#                  The optimiser flattens the TOTAL over all groups:
+#                      Fout = sum over groups of (spring force along its
+#                             own direction)
+#                  so two jaws closing on each other -- one group "-y", the
+#                  other "+y" -- both count positive. For a symmetric
+#                  two-jaw gripper each jaw carries Fout / 2.
+#
+#   "name" (optional) labels a group in the printed reports.
+#
+# A plain dict instead of a list still works (= one group).
+#
+# Check the directions BEFORE optimising:
+#   python voxel_main.py --show        an arrow per group shows its direction
+#   python linear_check_main.py        per-group displacement + the sign of
+#                                      Fout; it warns if the outputs move
+#                                      AGAINST their configured directions
+# If Fout comes out negative there and Ftar is None, the optimiser takes
+# its target from that starting response and flattens a force in the
+# OPPOSITE direction. Fix the directions, or set OPTIMIZATION["Ftar"] > 0.
+#
+# Reminder from top3d_cf.py's README: input and output groups that are only
+# weakly coupled through the body (e.g. far apart, or crossing directions on
+# a uniform start) give a sign-indefinite initial force path and the
+# optimiser will refuse to start.
 
 CLAMP = {
-    "faces": [9],              # face(s) bolted/mounted -- fully fixed
+    "faces": [19,23],              # face(s) bolted/mounted -- fully fixed
     "dofs": ["x", "y", "z"],
 }
 
-INPUT = {
-    "faces": [15],                # face(s) pushed by the actuator
-    "direction": "x",
-    "displacement": -0.004,     # m, total prescribed stroke (Stage 5)
-}
+INPUT = [
+    {"name": "actuator", "faces": [15], "direction": "x", "displacement": 0.001},
+]
 
-OUTPUT = {
-    "faces": [8,10],                 # face(s) that contact the load (e.g. tissue)
-    "direction": "x",
-    "spring_stiffness": 1000.0,  # N/m, grounded output spring (Stage 5)
-}
+OUTPUT = [
+    {"name": "upper_jaw", "faces": [8], "direction": "-y", "spring_stiffness": 1000.0},
+     {"name": "lower_jaw", "faces": [10], "direction": "+y", "spring_stiffness": 1000.0}
+]
+
+# Example: the same part as a gripper whose jaws close on each other. From
+# `main.py --list`, face 8 sits at y = +0.0025 and face 10 at y = -0.0025, so
+# closing is face 8 moving -y and face 10 moving +y. Confirm with
+# `voxel_main.py --show` that the two output arrows point at each other.
+#
+# OUTPUT = [
+#     {"name": "upper jaw", "faces": [8],  "direction": "-y", "spring_stiffness": 500.0},
+#     {"name": "lower jaw", "faces": [10], "direction": "+y", "spring_stiffness": 500.0},
+# ]
 
 # Faces available to the optimiser as free/design surface.
 # None = "every face not already claimed by CLAMP/INPUT/OUTPUT".
@@ -75,7 +110,7 @@ VOXEL_PAD_ELEMENTS = 1
 # --- Material (Stage 4 linear check, and Stage 5's E0/nu) -------------------
 # Defaults match top3d_cf.py's own Params (E0, nu).
 MATERIAL = {
-    "E": 2.0e9,   # Pa
+    "E": 2.0e9  ,   # Pa
     "nu": 0.40,
 }
 
@@ -94,3 +129,13 @@ OPTIMIZATION = {
     "nrise": 3,          # steps 1..nrise are the preload/rise region
     "Ftar": None,         # target plateau force, N; None = auto (median of the first pass)
 }
+
+# Design update used by optimize_main.py --run / --time:
+#   "mma"  Svanberg's GCMMA (optimization/mma.py): MMA that checks every
+#          step against a fresh force-path solve and shortens the ones
+#          that overshoot, so the design settles instead of swinging.
+#   "pg"   top3d_cf.py's own projected-gradient step. Every iteration moves
+#          the most sensitive elements by the full "move" above, so it
+#          flip-flops instead of settling; kept only for comparison.
+# Either way "move" is the largest change of any element in one iteration.
+OPTIMIZER = "mma"

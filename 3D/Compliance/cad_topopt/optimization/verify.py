@@ -18,8 +18,7 @@ import numpy as np
 from .voxel_model import VoxelModel, build_params, patched_model, top3d_cf
 
 
-def verify(grid, bc_nodes, clamp: dict, input_: dict, output: dict,
-           seed: int = 0) -> float:
+def verify(grid, bcs, seed: int = 0, label: str = "") -> float:
     rng = np.random.default_rng(seed)
     with patched_model():
         # top3d_cf.py's own verify() uses tol_nr=1e-13, tuned for its small
@@ -29,8 +28,7 @@ def verify(grid, bc_nodes, clamp: dict, input_: dict, output: dict,
         # looser all converge cleanly, only 1e-13 fails). 1e-10 is still
         # tight enough to not pollute the finite-difference comparisons
         # below (perturbation sizes d=1e-9, dd=1e-7).
-        p = build_params(grid, bc_nodes, clamp, input_, output,
-                          tol_nr=1e-10, verbose=False)
+        p = build_params(grid, bcs, tol_nr=1e-10, verbose=False)
         m: VoxelModel = top3d_cf.Model(p)
 
         x = rng.uniform(0.3, 0.9, m.nele)
@@ -39,11 +37,12 @@ def verify(grid, bc_nodes, clamp: dict, input_: dict, output: dict,
 
         U = np.zeros(m.ndof)
         U[m.free] = rng.normal(0, 3e-5, m.nfree)
-        U[m.indofs] = 0.1 * p.uin
+        U[m.indofs] = 0.1 * m.in_vals
 
         def total_energy(Uv):
             W, _, _ = m.element(Uv[m.edof], want_K=False, want_W=True)
-            return float(W @ Eabs) + 0.5 * m.ks * float(Uv[m.outdofs] @ Uv[m.outdofs])
+            # springs: 0.5 * sum_i k_i u_i^2, one stiffness per output dof
+            return float(W @ Eabs) + 0.5 * float(m.ks @ Uv[m.outdofs] ** 2)
 
         Fint, _ = m.internal_force(U, Eabs)
         d = 1e-9
@@ -68,7 +67,7 @@ def verify(grid, bc_nodes, clamp: dict, input_: dict, output: dict,
 
         m._Upath = None
         Fout, dFout, ok = m.force_path(Eabs, dEabs)
-        assert ok, "load path failed during verification -- reduce uin or check the mesh"
+        assert ok, "load path failed during verification -- reduce the input displacements or check the mesh"
         # dFout is only ever computed for k > nrise (force_path's need_lu is
         # False during the rise region, by top3d_cf.py's own design -- see
         # its docstring), so dFout[:, :nrise] is always exactly zero. Comparing
@@ -92,6 +91,8 @@ def verify(grid, bc_nodes, clamp: dict, input_: dict, output: dict,
             worst = max(worst, np.abs(fd[k0:] - dFout[e, k0:]).max()
                         / np.abs(fd[k0:]).max())
 
+    if label:
+        print(label)
     print(f"1. fint vs dW/du       rel err = {e1:.3e}")
     print(f"2. Kt   vs dfint/du    rel err = {e2:.3e}")
     print(f"3. adjoint dFout/dx    rel err = {worst:.3e}")

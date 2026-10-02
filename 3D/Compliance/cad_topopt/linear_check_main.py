@@ -14,12 +14,17 @@ mesh or the CAD-face-to-node mapping is wrong, an independent solver is much
 less likely to coincidentally "confirm" the same bug than reusing the same
 code path would be.
 
-Boundary conditions mirror top3d_cf.py's roles directly:
-    CLAMP  fixed in all 3 components
-    INPUT  prescribed displacement in one component (config.INPUT)
-    OUTPUT a grounded spring in one component (config.OUTPUT)
+Boundary conditions are exactly Stage 5's (same mesh/boundary.py code):
+    CLAMP   fixed on the clamped components
+    INPUT   every input group driven along its own direction
+    OUTPUT  every output group on a grounded spring along its own axis
 so a look at this deformed shape is a real preview of how load will flow
 through the part once Stage 5 runs the actual nonlinear optimization.
+
+Read the per-group lines to check your directions: an output group whose
+displacement comes out negative is moving AGAINST the direction you gave it
+(on the solid, undesigned part), and a negative Fout means auto-Ftar will
+optimise for a force in the opposite direction to the one you configured.
 """
 from __future__ import annotations
 
@@ -28,11 +33,8 @@ import argparse
 import numpy as np
 
 import config
-from cad.face_manager import resolve
-from cad.import_cad import CadModel
 from fem.linear_check import run
-from mesh.face_mapping import map_faces_to_nodes
-from mesh.voxelize import voxelize
+from mesh.boundary import describe, prepare
 
 
 def main() -> None:
@@ -47,19 +49,14 @@ def main() -> None:
                           "(default: auto, sized to be visible)")
     args = ap.parse_args()
 
-    with CadModel(config.STEP_FILE) as cad:
-        assignment = resolve(cad.face_tags(), config.CLAMP, config.INPUT,
-                              config.OUTPUT, config.DESIGN_FACES)
-        grid = voxelize(cad, nel_long_axis=args.nel, pad_elements=args.pad)
-        bc_nodes = map_faces_to_nodes(assignment, grid)
+    try:
+        grid, bc_nodes, _assignment, bcs = prepare(nel=args.nel, pad=args.pad)
+    except ValueError as e:
+        raise SystemExit(f"boundary conditions: {e}")
+    print("\n  boundary conditions:")
+    describe(bcs)
 
-    for role in ("clamp", "input", "output"):
-        if len(bc_nodes[role]) == 0:
-            raise SystemExit(f"'{role}' matched no nodes -- fix the face "
-                              f"selection or raise --nel before solving.")
-
-    result = run(grid, bc_nodes, config.CLAMP, config.INPUT, config.OUTPUT,
-                 **config.MATERIAL)
+    result = run(grid, bcs, **config.MATERIAL)
 
     react_clamp = result.reaction[bc_nodes["clamp"]].sum(axis=0)
     react_input = result.reaction[bc_nodes["input"]].sum(axis=0)
@@ -68,7 +65,6 @@ def main() -> None:
         axis=0)).max()
 
     print(f"\n  max |displacement|         {result.max_disp:.6g} m")
-    print(f"  mean displacement, output  {result.output_disp_mean}")
     print(f"  reaction sum,  clamp       {react_clamp}")
     print(f"  reaction sum,  input       {react_input}")
     print(f"  clamp + input reactions balance: "
@@ -76,15 +72,30 @@ def main() -> None:
     print(f"  max residual on free dofs  {react_free_max:.3e}  "
           f"(should be ~0 -- equilibrium)")
 
-    if result.output_disp_mean[{"x": 0, "y": 1, "z": 2}[config.OUTPUT["direction"]]] == 0:
-        print("\n  WARNING: zero displacement at the output nodes in the "
-              "configured direction -- input and output may not be "
+    print("\n  mean displacement of each group, along its own direction:")
+    for g, disp in result.group_disp:
+        flag = ""
+        if g.role == "output" and disp <= 0:
+            flag = "   <- moves AGAINST its configured direction"
+        print(f"    {g.name:12s} {g.direction:>3s}  {disp:+.4e} m{flag}")
+
+    print(f"\n  Fout (linear preview)      {result.fout:+.4e} N")
+    if result.fout == 0:
+        print("\n  WARNING: zero output force -- input and output are not "
               "mechanically coupled through this geometry.")
+    elif result.fout < 0 and config.OPTIMIZATION.get("Ftar") is None:
+        print("\n  WARNING: Fout is negative, so the outputs as a whole move "
+              "against their\n  configured directions. With Ftar = None, "
+              "Stage 5 takes its target from\n  this starting response and "
+              "will optimise a constant force in the OPPOSITE\n  direction. "
+              "Flip the output direction(s) if they are wrong, or set\n  "
+              "OPTIMIZATION['Ftar'] to a positive value to demand the "
+              "configured direction.")
 
     if args.show or args.screenshot:
         from mesh.viewer import show_deformed
         show_deformed(grid, result.u, bc_nodes, scale=args.scale,
-                      screenshot=args.screenshot)
+                      screenshot=args.screenshot, groups=bcs.groups)
 
 
 if __name__ == "__main__":

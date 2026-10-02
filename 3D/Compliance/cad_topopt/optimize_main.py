@@ -8,7 +8,8 @@ OUTPUT faces from config.py.
                                               a small, known-good mesh (not
                                               your CAD file) -- run this
                                               first, and after any change to
-                                              optimization/voxel_model.py
+                                              optimization/voxel_model.py or
+                                              optimization/mma.py
     python optimize_main.py --time 5         time 5 optimisation iterations
                                               on your real part
     python optimize_main.py --run            full optimisation run
@@ -24,58 +25,73 @@ See reconstruct_main.py.
 
 top3d_cf.py itself is never modified: this imports it, subclasses its Model
 (optimization/voxel_model.py), and monkeypatches that one name for the
-duration of the call so its own optimise() builds a VoxelModel instead of
-its box mesh. Every other line of physics -- the neo-Hookean element, the
-Newton solver, the adjoint, the SIMP/Heaviside optimiser loop -- runs
-unchanged.
+duration of the call so the optimiser loop builds a VoxelModel instead of
+its box mesh. Every line of physics -- the neo-Hookean element, the Newton
+solver, the adjoint, the filter and Heaviside projection -- runs unchanged.
+Only the design update is swappable (config.OPTIMIZER): "mma" runs
+optimization/mma.py's copy of top3d_cf.optimise() with a GCMMA step
+(Svanberg's globally convergent MMA), "pg" runs top3d_cf.optimise() itself.
 """
 from __future__ import annotations
 
 import argparse
 
 import config
-from cad.face_manager import resolve
-from cad.import_cad import CadModel
-from mesh.face_mapping import map_faces_to_nodes
-from mesh.voxelize import voxelize
+from mesh.boundary import describe, prepare
+from optimization import mma
 from optimization.voxel_model import build_params, patched_model, top3d_cf
+
+OPTIMISERS = {"mma": mma.optimise, "pg": top3d_cf.optimise}
 
 
 def _build_real_model():
-    """Voxelize+map faces for whatever config.py currently points at."""
-    with CadModel(config.STEP_FILE) as cad:
-        assignment = resolve(cad.face_tags(), config.CLAMP, config.INPUT,
-                              config.OUTPUT, config.DESIGN_FACES)
-        grid = voxelize(cad, nel_long_axis=config.VOXEL_NEL_LONG_AXIS,
-                         pad_elements=config.VOXEL_PAD_ELEMENTS)
-        bc_nodes = map_faces_to_nodes(assignment, grid)
-    for role in ("clamp", "input", "output"):
-        if len(bc_nodes[role]) == 0:
-            raise SystemExit(f"'{role}' matched no nodes -- fix the face "
-                              f"selection (see voxel_main.py) before optimizing.")
-    return grid, bc_nodes
+    """Voxelize + map faces + build dof BCs for whatever config.py points at."""
+    try:
+        grid, _bc_nodes, _assignment, bcs = prepare()
+    except ValueError as e:
+        raise SystemExit(f"boundary conditions: {e}")
+    print("  boundary conditions:")
+    describe(bcs)
+    return grid, bcs
 
 
-def _self_test_model():
-    """A small, fixed, known-non-degenerate mesh for --verify, independent
-    of whatever config.py happens to point at right now (which may be mid
-    face-selection, or have an unresolved clamp/output overlap)."""
+# Two self-test load cases on the same small part, independent of whatever
+# config.py happens to point at right now (which may be mid face-selection).
+#
+# sample_bracket.step faces:  1 x=0 end, 6 x=max end, 2 y=0, 4 y=max,
+#                             3/5 top/bottom, 7 the through-hole.
+_SELF_TESTS = {
+    # The original case: one input, one output, one direction each. Must
+    # reproduce the numbers from before per-group BCs existed -- this is
+    # the regression check that the refactor changed nothing for them.
+    # Input and output share an edge, so they must act on different axes.
+    "single direction": dict(
+        clamp={"faces": [1], "dofs": ["x", "y", "z"]},
+        input_={"faces": [6], "direction": "x", "displacement": -1e-4},
+        output={"faces": [4], "direction": "y", "spring_stiffness": 1.0e3},
+    ),
+    # Everything the per-group code adds: a signed input direction, a second
+    # input on another face and axis, and two outputs with OPPOSITE signs and
+    # different stiffnesses -- jaws 2 and 4 closing on each other along y.
+    "multi direction": dict(
+        clamp={"faces": [1], "dofs": ["x", "y", "z"]},
+        input_=[{"faces": [6], "direction": "-x", "displacement": 1e-4},
+                {"faces": [7], "direction": "+y", "displacement": 5e-5}],
+        output=[{"faces": [2], "direction": "+y", "spring_stiffness": 400.0},
+                {"faces": [4], "direction": "-y", "spring_stiffness": 1200.0}],
+    ),
+}
+
+
+def _self_test_models():
     sample = config.PROJECT_DIR / "cad_models" / "sample_bracket.step"
     if not sample.exists():
         raise SystemExit(f"{sample} not found -- run "
-                          f"`python cad_models/make_sample.py` once first.")
-    with CadModel(sample) as cad:
-        # input and output are on adjacent (edge-sharing) faces here, so
-        # they must measure different directions -- both in "x" would put
-        # them on the exact same dof at the shared edge, an unresolvable
-        # conflict (not the harmless clamp/output case). See voxel_model.py.
-        clamp = {"faces": [1], "dofs": ["x", "y", "z"]}
-        input_ = {"faces": [6], "direction": "x", "displacement": -1e-4}
-        output = {"faces": [4], "direction": "y", "spring_stiffness": 1.0e3}
-        assignment = resolve(cad.face_tags(), clamp, input_, output, None)
-        grid = voxelize(cad, nel_long_axis=8, pad_elements=1)
-        bc_nodes = map_faces_to_nodes(assignment, grid)
-    return grid, bc_nodes, clamp, input_, output
+                         f"`python cad_models/make_sample.py` once first.")
+    for label, case in _SELF_TESTS.items():
+        grid, _bc_nodes, _assignment, bcs = prepare(
+            step_file=sample, design_faces=None, nel=8, pad=1, **case)
+        yield label, grid, bcs
 
 
 def _reconstruct(xPhys, grid, stl_path: str, step_path: str) -> None:
@@ -126,18 +142,26 @@ def main() -> None:
 
     if args.verify:
         from optimization.verify import verify
-        grid, bc_nodes, clamp, input_, output = _self_test_model()
-        worst = verify(grid, bc_nodes, clamp, input_, output)
+        worst = 0.0
+        for label, grid, bcs in _self_test_models():
+            print(f"\n[{label}]")
+            describe(bcs)
+            worst = max(worst, verify(grid, bcs))
+        print("\n[GCMMA vs SLSQP]")
+        worst = max(worst, mma.self_test())
         print("\nPASS" if worst < 1e-4 else "\nFAIL")
         return
 
     if args.time or args.run:
-        grid, bc_nodes = _build_real_model()
+        if config.OPTIMIZER not in OPTIMISERS:
+            raise SystemExit(f"config.OPTIMIZER = {config.OPTIMIZER!r}; "
+                             f"expected one of {sorted(OPTIMISERS)}")
+        grid, bcs = _build_real_model()
         with patched_model():
-            p = build_params(grid, bc_nodes)
+            p = build_params(grid, bcs)
             if args.time:
                 p.maxiter = args.time
-            xPhys, hist, m = top3d_cf.optimise(p)
+            xPhys, hist, m = OPTIMISERS[config.OPTIMIZER](p)
         if args.vtu:
             from optimization.export import export_result
             export_result(xPhys, m, args.vtu)

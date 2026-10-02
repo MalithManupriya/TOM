@@ -8,7 +8,8 @@ elements, and converts the CLAMP/INPUT/OUTPUT CAD faces into node sets on
 that grid -- no node numbers typed by hand.
 
     python voxel_main.py                    build and report
-    python voxel_main.py --show             ... plus a 3-D view
+    python voxel_main.py --show             ... plus a 3-D view, with an
+                                            arrow per input/output group
     python voxel_main.py --verify           ... plus structural mesh checks
     python voxel_main.py --nel 40           override the grid resolution
     python voxel_main.py --save mesh.npz    ... and write the mesh out
@@ -28,24 +29,18 @@ import numpy as np
 from scipy import ndimage
 
 import config
-from cad.face_manager import resolve
-from cad.import_cad import CadModel
-from mesh.face_mapping import map_faces_to_nodes
-from mesh.voxelize import VoxelGrid, voxelize
+from mesh.boundary import describe, prepare
+from mesh.voxelize import VoxelGrid
 
 
 def build(nel_long_axis: int, pad_elements: int):
-    """Run the whole CAD -> voxel -> node-set chain in one Gmsh session."""
-    with CadModel(config.STEP_FILE) as cad:
-        assignment = resolve(cad.face_tags(), config.CLAMP, config.INPUT,
-                              config.OUTPUT, config.DESIGN_FACES)
-        grid = voxelize(cad, nel_long_axis=nel_long_axis,
-                         pad_elements=pad_elements)
-        bc_nodes = map_faces_to_nodes(assignment, grid)
-    return grid, bc_nodes, assignment
+    """CAD -> voxel -> node sets -> dof BCs. A BC conflict is reported, not
+    raised (bcs comes back None), so the mesh can still be inspected."""
+    return prepare(nel=nel_long_axis, pad=pad_elements, strict=False)
 
 
-def report(grid: VoxelGrid, bc_nodes: dict[str, np.ndarray], assignment) -> None:
+def report(grid: VoxelGrid, bc_nodes: dict[str, np.ndarray], assignment,
+           bcs=None) -> None:
     bbox_lo = grid.origin
     bbox_hi = grid.origin + np.array([grid.nelx, grid.nely, grid.nelz]) * grid.h
     filled = grid.n_active / (grid.nelx * grid.nely * grid.nelz)
@@ -70,6 +65,11 @@ def report(grid: VoxelGrid, bc_nodes: dict[str, np.ndarray], assignment) -> None
         faces = assignment.faces_with_role(role)
         print(f"    {role:8s} faces {str(faces):10s} -> "
               f"{len(bc_nodes[role]):5d} nodes")
+
+    if bcs is not None:
+        print()
+        print("  per group (each acts along its own direction):")
+        describe(bcs)
 
     for role, idx in bc_nodes.items():
         if len(idx) == 0:
@@ -181,8 +181,8 @@ def main() -> None:
                      help="structural checks on the generated mesh")
     args = ap.parse_args()
 
-    grid, bc_nodes, assignment = build(args.nel, args.pad)
-    report(grid, bc_nodes, assignment)
+    grid, bc_nodes, assignment, bcs = build(args.nel, args.pad)
+    report(grid, bc_nodes, assignment, bcs)
 
     if args.verify:
         print()
@@ -193,7 +193,8 @@ def main() -> None:
 
     if args.show or args.screenshot:
         from mesh.viewer import show_voxel_model
-        show_voxel_model(grid, bc_nodes, screenshot=args.screenshot)
+        show_voxel_model(grid, bc_nodes, screenshot=args.screenshot,
+                         groups=bcs.groups if bcs is not None else None)
 
 
 if __name__ == "__main__":

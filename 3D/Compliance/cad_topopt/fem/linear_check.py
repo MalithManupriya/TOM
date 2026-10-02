@@ -9,13 +9,16 @@ finite-element work -- shape functions, quadrature, the elasticity bilinear
 form, the sparse solve -- comes from scikit-fem; nothing here reimplements
 FE math, only wires the voxel mesh and boundary conditions into it.
 
-Boundary conditions mirror what Stage 5 will do with top3d_cf.py, so this
-check exercises the same roles, just linearly and in one step instead of
-incrementally with a nonlinear Newton solve:
-    CLAMP  -> Dirichlet, u = 0 in all 3 components
-    INPUT  -> Dirichlet, prescribed displacement in one component
-    OUTPUT -> grounded spring in one component (added to the diagonal,
-              exactly how top3d_cf.py's own `ks` output spring works)
+Boundary conditions are the very same DofBCs object Stage 5 uses (built by
+mesh/boundary.py), applied linearly and in one step instead of incrementally
+with a nonlinear Newton solve:
+    CLAMP  -> Dirichlet, u = 0 on the clamped components
+    INPUT  -> Dirichlet, each input group's full-stroke displacement along
+              its own direction
+    OUTPUT -> grounded springs on each output group's own axis (added to
+              the diagonal, exactly how top3d_cf.py's `ks` spring works)
+It also reports Fout = out_w @ u, the same output measure the optimiser
+uses, so its sign previews which way auto-Ftar will point.
 """
 from __future__ import annotations
 
@@ -26,6 +29,7 @@ import scipy.sparse as sp
 from skfem import Basis, ElementHex1, ElementVector, MeshHex, condense, solve
 from skfem.models.elasticity import linear_elasticity
 
+from mesh.boundary import DofBCs
 from mesh.voxelize import VoxelGrid
 
 # Permutation from our own H8 corner order (mesh/voxelize.py's
@@ -36,15 +40,15 @@ from mesh.voxelize import VoxelGrid
 # (n_active * h**3), not just that one cube comes out non-degenerate.
 _SKFEM_PERM = [0, 1, 3, 4, 2, 5, 7, 6]
 
-_AXIS = {"x": 0, "y": 1, "z": 2}
-
 
 @dataclass
 class LinearCheckResult:
     u: np.ndarray              # (n_used_nodes, 3) displacement, grid node numbering
     reaction: np.ndarray       # (n_used_nodes, 3) nodal out-of-balance force
     max_disp: float
-    output_disp_mean: np.ndarray  # (3,) mean displacement at output nodes
+    fout: float                # out_w @ u -- the optimiser's output measure, N
+    # (group, mean displacement of its nodes along its own signed direction)
+    group_disp: list
 
 
 def _compact_mesh(grid: VoxelGrid) -> tuple[MeshHex, np.ndarray, np.ndarray]:
@@ -64,11 +68,15 @@ def _compact_mesh(grid: VoxelGrid) -> tuple[MeshHex, np.ndarray, np.ndarray]:
     return mesh, used_idx, new_of
 
 
-def run(grid: VoxelGrid, bc_nodes: dict[str, np.ndarray], clamp: dict,
-        input_: dict, output: dict, E: float, nu: float) -> LinearCheckResult:
+def run(grid: VoxelGrid, bcs: DofBCs, E: float, nu: float) -> LinearCheckResult:
     mesh, used_idx, new_of = _compact_mesh(grid)
     basis = Basis(mesh, ElementVector(ElementHex1()))
     dofs = basis.nodal_dofs  # (3, n_used_nodes): dofs[component, node]
+
+    def to_skfem(grid_dofs: np.ndarray) -> np.ndarray:
+        """Background-lattice dof (3*node + axis) -> scikit-fem dof."""
+        node, comp = np.divmod(grid_dofs, 3)
+        return dofs[comp, new_of[node]]
 
     mu = E / (2 * (1 + nu))
     lam = E * nu / ((1 + nu) * (1 - 2 * nu))
@@ -76,26 +84,17 @@ def run(grid: VoxelGrid, bc_nodes: dict[str, np.ndarray], clamp: dict,
 
     f = np.zeros(basis.N)
 
-    clamp_new = new_of[bc_nodes["clamp"]]
-    dirichlet = [dofs[:, clamp_new].ravel()]
-
-    in_axis = _AXIS[input_["direction"]]
-    input_new = new_of[bc_nodes["input"]]
-    input_dofs = dofs[in_axis, input_new]
-    dirichlet.append(input_dofs)
+    input_dofs = to_skfem(bcs.in_dofs)
     x0 = np.zeros(basis.N)
-    x0[input_dofs] = input_["displacement"]
+    x0[input_dofs] = bcs.in_vals
     # condense() requires one flat ndarray of dof indices (a plain Python
-    # list raises inside skfem), and np.unique also protects against a node
-    # Stage 3 already warned about sharing two roles (e.g. clamp & output on
-    # a shared edge) turning into a duplicate/conflicting entry here.
-    dirichlet = np.unique(np.concatenate(dirichlet))
+    # list raises inside skfem). mesh/boundary.py has already rejected any
+    # dof that is both clamped and driven, so this union is disjoint.
+    dirichlet = np.unique(np.concatenate([to_skfem(bcs.fixed), input_dofs]))
 
-    out_axis = _AXIS[output["direction"]]
-    output_new = new_of[bc_nodes["output"]]
-    output_dofs = dofs[out_axis, output_new]
-    k_each = output["spring_stiffness"] / max(len(output_dofs), 1)
-    K = (K + sp.diags(np.bincount(output_dofs, minlength=basis.N) * k_each)).tocsr()
+    output_dofs = to_skfem(bcs.out_dofs)
+    K = (K + sp.csr_matrix((bcs.out_k, (output_dofs, output_dofs)),
+                           shape=K.shape)).tocsr()
 
     u = solve(*condense(K, f, x=x0, D=dirichlet))
 
@@ -106,7 +105,11 @@ def run(grid: VoxelGrid, bc_nodes: dict[str, np.ndarray], clamp: dict,
         u_grid[used_idx, c] = u[dofs[c]]
         reaction_grid[used_idx, c] = reaction_flat[dofs[c]]
 
+    group_disp = [(g, float(g.sign * u_grid[nodes, g.axis].mean()))
+                  for g, nodes in bcs.groups]
+
     return LinearCheckResult(
         u=u_grid, reaction=reaction_grid,
         max_disp=float(np.linalg.norm(u_grid, axis=1).max()),
-        output_disp_mean=u_grid[bc_nodes["output"]].mean(axis=0))
+        fout=float(bcs.out_w @ u[output_dofs]),
+        group_disp=group_disp)
